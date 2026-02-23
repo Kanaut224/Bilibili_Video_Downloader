@@ -9,7 +9,7 @@ import shutil
 import tkinter as tk
 from tkinter import END, MULTIPLE, Listbox, messagebox, scrolledtext,Toplevel,filedialog
 from io import BytesIO
-from typing import final
+from typing import Self, final
 
 import requests
 import ttkbootstrap as ttk
@@ -553,8 +553,8 @@ class BiliDownloaderApp:
                 dash_data = self.get_play_info(bvid, cid)
                 if not dash_data: continue
                 
-                safe_title = re.sub(r'[\\/*?:"<>|]', "", main_title)[:30]
-                safe_part = re.sub(r'[\\/*?:"<>|]', "", p_part)[:30]
+                safe_title = re.sub(r'[\\/*?:"<>|]', "", main_title).strip(" .")[:30]
+                safe_part = re.sub(r'[\\/*?:"<>|]', "", p_part).strip(" .")[:30]
                 
                 base_name = f"{safe_title}" if self.video_metadata['pages_num'] == 1 else f"{safe_title}_P{p_num}_{safe_part}"
 
@@ -574,21 +574,31 @@ class BiliDownloaderApp:
                             self.log(f"  [Cover Error] {e}")
                             temp_cover = None
 
-                final_mp4 = os.path.join(self.download_dir, f"{base_name}.mp4")
-                final_m4a = os.path.join(self.download_dir, f"{base_name}.m4a")
-
-                temp_v = os.path.join(self.download_dir, f"temp_v_{cid}.m4s")
-                temp_a = os.path.join(self.download_dir, f"temp_a_{cid}.m4s")
-                
                 video_obj = None
                 audio_obj = None
 
-                # according mode
+                # 1. 优先获取音视频流对象，以便判断格式
                 if mode in ["video", "merge"]:
                     video_obj = self.choose_video_by_priority(dash_data, v_priority)
                 
                 if mode in ["audio", "merge"]:
                     audio_obj = self.choose_audio_by_priority(dash_data, a_priority)
+
+                # 2. 根据音频流的 ID，动态决定输出的后缀名
+                audio_ext = ".m4a" # 默认普通 AAC 音质使用 .m4a 容器
+                if audio_obj:
+                    a_id = audio_obj.get('id', 0)
+                    if a_id == 30251:
+                        audio_ext = ".flac" # Hi-Res 无损必须是 .flac
+                    elif a_id == 30250:
+                        audio_ext = ".eac3" # 杜比全景声必须是 .eac3
+
+                # 3. 动态生成最终文件名
+                final_mp4 = os.path.join(self.download_dir, f"{base_name}.mp4")
+                final_audio_out = os.path.join(self.download_dir, f"{base_name}{audio_ext}")
+
+                temp_v = os.path.join(self.download_dir, f"temp_v_{cid}.m4s")
+                temp_a = os.path.join(self.download_dir, f"temp_a_{cid}.m4s")
 
                 # print log
                 log_msg = []
@@ -615,8 +625,11 @@ class BiliDownloaderApp:
                     self.download_file(audio_obj['baseUrl'], temp_a, f"{task_name} Audio", 0, 90)
                     
                     self.update_progress(90, f"Processing Audio {task_name}...")
-                    if self.process_ffmpeg_single(temp_a, final_m4a, is_audio=True, cover_path=temp_cover):
-                        self.log(f"[FINISHED] Saved: {os.path.basename(final_m4a)}")
+                    
+                    safe_cover = temp_cover if audio_ext != ".eac3" else None
+                    
+                    if self.process_ffmpeg_single(temp_a, final_audio_out, is_audio=True, cover_path=safe_cover):
+                        self.log(f"[FINISHED] Saved: {os.path.basename(final_audio_out)}")
                         self.update_progress(100, f"Done {task_name}")
 
                 # Video Only
@@ -751,8 +764,16 @@ class BiliDownloaderApp:
                 headers['Range'] = f'bytes={downloaded}-'
                 
                 res = requests.get(url, headers=headers, stream=True, timeout=20)
+                
+                if res.status_code in [401, 403]:
+                    self.log(f"[AUTH ERROR] {task_name}: This account is not VIP or Cookie is expired (HTTP 403)")
+                    raise Exception("HTTP 403 Forbidden - Rufused!")
+                
                 if res.status_code == 416: # Range not satisfiable (already done)
                     return
+                
+                res.raise_for_status() 
+                # ============================================
 
                 total = downloaded + int(res.headers.get('content-length', 0))
                 mode = 'ab' if downloaded > 0 else 'wb'
@@ -791,26 +812,33 @@ class BiliDownloaderApp:
             
         return None
 
+    def ffmpeg_error_message(self, stderr_bytes):
+        if not stderr_bytes:
+            self.log("[FFMPEG ERROR] Unknown error (No stderr output).")
+            return
+        
+        error_msg = stderr_bytes.decode('utf-8', errors='ignore').strip()
+        
+        lines = error_msg.split('\n')
+        error_summary = "\n".join(lines[-5:])
+        
+        self.log(f"[FFMPEG FAILED DETAILS] :\n{error_summary}")
+
     # Merge
-    def combine_video_audio(self, v_path, a_path, out_path,cover_path=None):
+    def combine_video_audio(self, v_path, a_path, out_path, cover_path=None):
         if os.path.exists(out_path): os.remove(out_path)
         ffmpeg_exe = self._get_ffmpeg_path()
         if not ffmpeg_exe:
             self.log("[ERROR] ffmpeg not found (Check script dir or system PATH).")
             return False
         
-        # -c copy is fast and lossless
         cmd = [ffmpeg_exe, '-i', v_path, '-i', a_path]
         
         if cover_path and os.path.exists(cover_path):
-            # 输入流 0:视频, 1:音频, 2:封面
-            # -map 0, -map 1, -map 2: 选中所有流
-            # -c copy: 不转码直接复制
-            # -disposition:v:1 attached_pic: 把第二个视频流(封面)标记为附件图片
-            cmd.extend(['-i', cover_path, '-map', '0', '-map', '1', '-map', '2', '-c', 'copy', '-disposition:v:1', 'attached_pic'])
+            cmd.extend(['-i', cover_path, '-map', '0', '-map', '1', '-map', '2', 
+                        '-c', 'copy', '-strict', 'experimental', '-disposition:v:1', 'attached_pic'])
         else:
-            # 无封面模式
-            cmd.extend(['-c', 'copy'])
+            cmd.extend(['-c', 'copy', '-strict', 'experimental'])
             
         cmd.extend(['-y', out_path])
         return self._run_ffmpeg(cmd, [v_path, a_path])
@@ -843,22 +871,32 @@ class BiliDownloaderApp:
                 cmd.extend(['-an', '-c:v', 'copy'])
         
         cmd.extend(['-y', out_path])
+        self.ffmpeg_error_message
         return self._run_ffmpeg(cmd, [input_path])
 
     def _run_ffmpeg(self, cmd, temp_files_to_remove):
         try:
-            subprocess.run(
+            result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=0x08000000 if os.name == 'nt' else 0
             )
-            # Cleanup temps
+            
+            # 判断 FFmpeg 进程是否异常退出 (returncode 不为 0 说明发生了错误)
+            if result.returncode != 0:
+                self.ffmpeg_error_message(result.stderr)
+                return False
+
+            # 如果成功，清理临时文件
             for f in temp_files_to_remove:
-                if os.path.exists(f): os.remove(f)
+                if os.path.exists(f): 
+                    os.remove(f)
             return True
+            
         except Exception as e:
-            self.log(f"[FFMPEG ERROR] {e}")
+            # 捕获系统级别的异常 (比如 FFmpeg 根本没启动)
+            self.log(f"[FFMPEG PROCESS EXCEPTION] {e}")
             return False
 
 
