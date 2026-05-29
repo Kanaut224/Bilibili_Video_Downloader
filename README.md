@@ -59,7 +59,7 @@ pip install requests ttkbootstrap qrcode pillow
 
 #### 4. 运行
 ```bash
-python spider.py
+python BilibiliVideoDownloader.py
 ```
 
 ## 📖 使用指南 (Usage)
